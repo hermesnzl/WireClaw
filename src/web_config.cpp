@@ -12,6 +12,7 @@
 #include <ESPmDNS.h>
 #include <WiFi.h>
 #include <LittleFS.h>
+#include <esp_ota_ops.h>
 #include "version.h"
 #include "rules.h"
 #include "devices.h"
@@ -353,9 +354,16 @@ static void handleGetRules() {
         first = false;
 
         /* Source description */
-        char src[80];
+        char src[120];
         if (r->condition == COND_CHAINED) {
             snprintf(src, sizeof(src), "chained");
+        } else if (r->sensor_url[0]) {
+            float rd = r->last_reading;
+            int code = (int)rd;
+            const char *state = (rd < 1.0f) ? "DOWN" :
+                                (code >= 200 && code < 400) ? "OK" : "HTTP";
+            snprintf(src, sizeof(src), "url %s (%s)",
+                r->sensor_url, state);
         } else if (r->sensor_name[0]) {
             snprintf(src, sizeof(src), "%s %s %d",
                 r->sensor_name, conditionOpName(r->condition), (int)r->threshold);
@@ -955,11 +963,30 @@ static void handleUpdateGet() {
         "<label for=\"fw\">Firmware file</label>"
         "<input type=\"file\" id=\"fw\" name=\"firmware\" accept=\".bin\" required>"
         "<div class=\"actions\">"
-        "<button id=\"b\" class=\"btn btn-primary\" type=\"submit\" "
-        "form=\"upform\" onclick=\"this.disabled=true;document.getElementById('s').textContent='Uploading…';document.getElementById('s').style.color='var(--accent)';\">Upload &amp; Flash</button>"
+        "<button id=\"b\" class=\"btn btn-primary\" type=\"button\" onclick=\"up()\">Upload &amp; Flash</button>"
         "</div>"
+        "<div style=\"height:8px;background:var(--bg2);border:1px solid var(--border);border-radius:9999px;overflow:hidden;margin-top:1.25rem\">"
+        "<div id=\"bar\" style=\"height:100%;width:0;background:var(--accent);border-radius:9999px;transition:width .15s\"></div></div>"
         "<div id=\"s\"></div>"
-        "<form id=\"upform\" method=\"post\" enctype=\"multipart/form-data\" action=\"/update\"></form>"
+        "<script>"
+        "function up(){"
+        "var f=document.getElementById('fw').files[0];"
+        "if(!f){return;}"
+        "var fd=new FormData();fd.append('firmware',f);"
+        "var x=new XMLHttpRequest();x.open('POST','/update',true);"
+        "x.upload.onprogress=function(e){if(e.lengthComputable){var p=e.loaded/e.total*100;"
+        "document.getElementById('bar').style.width=p+'%';"
+        "var s=document.getElementById('s');s.style.color='var(--accent)';"
+        "s.textContent='Uploading '+Math.round(p)+'%';}};"
+        "x.onload=function(){var s=document.getElementById('s');"
+        "if(x.status==200){s.style.color='var(--accent)';s.textContent='Update successful. Rebooting…';}"
+        "else{s.style.color='var(--red)';s.textContent='Error '+x.status+': '+x.responseText;"
+        "document.getElementById('b').disabled=false;}};"
+        "x.onerror=function(){var s=document.getElementById('s');s.style.color='var(--red)';"
+        "s.textContent='Network error';document.getElementById('b').disabled=false;};"
+        "var s=document.getElementById('s');s.style.color='var(--text2)';s.textContent='Starting…';"
+        "document.getElementById('b').disabled=true;x.send(fd);}"
+        "</script>"
         "</div></div></body></html>");
     server.send(200, "text/html", html);
 }
@@ -972,22 +999,45 @@ static void handleUpdatePost() {
     if (upload.status == UPLOAD_FILE_START) {
         received = 0;
         expected = upload.totalSize;
-        Serial.printf("OTA: start (%u bytes)\n", expected);
+        Serial.printf("OTA[START] totalSize=%u\n", expected);
+        const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+        if (next) {
+            Serial.printf("OTA[START] next_slot=label:'%s' off=0x%x size=0x%x (%u)\n",
+                next->label, next->address, next->size, next->size);
+        } else {
+            Serial.printf("OTA[START] next_slot=NULL\n");
+        }
+        /* Begin with the real reported size. UPDATE_SIZE_UNKNOWN was observed
+         * to fail esp_ota_end with a silent "No Error"; using the actual
+         * content length gives the OTA layer the correct bounds. */
         if (!Update.begin(expected, U_FLASH)) {
-            Update.printError(Serial);
-            server.send(500, "text/plain", "Update.begin failed");
-            return;
+            Serial.printf("OTA[START] begin(real) FAILED err=%s size=%u\n",
+                Update.errorString(), (unsigned)Update.size());
+            /* fall back to unknown-size streaming */
+            if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+                Serial.printf("OTA[START] begin(unknown) FAILED err=%s\n", Update.errorString());
+                server.send(500, "text/plain", String("Update.begin failed: ") + Update.errorString());
+                return;
+            }
+            Serial.printf("OTA[START] begin(unknown) OK size=%u\n", (unsigned)Update.size());
+        } else {
+            Serial.printf("OTA[START] begin(real) OK size=%u\n", (unsigned)Update.size());
         }
     } else if (upload.status == UPLOAD_FILE_WRITE) {
         if (upload.currentSize > 0) {
-            if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-                Update.printError(Serial);
-                server.send(500, "text/plain", "Update.write failed");
+            size_t wrote = Update.write(upload.buf, upload.currentSize);
+            if (wrote != upload.currentSize) {
+                Serial.printf("OTA[WRITE] write FAILED wrote=%u want=%u err=%s\n",
+                    wrote, upload.currentSize, Update.errorString());
+                server.send(500, "text/plain", String("Update.write failed: ") + Update.errorString());
                 return;
             }
             received += upload.currentSize;
         }
     } else if (upload.status == UPLOAD_FILE_END) {
+        Serial.printf("OTA[END] received=%u progress=%u size=%u err=%s hasErr=%d\n",
+            received, (unsigned)Update.progress(), (unsigned)Update.size(),
+            Update.errorString(), Update.hasError());
         if (Update.end(true)) {
             Serial.printf("OTA: success %u bytes, rebooting\n", received);
             server.send(200, "text/plain",
@@ -995,8 +1045,9 @@ static void handleUpdatePost() {
             delay(500);
             ESP.restart();
         } else {
-            Update.printError(Serial);
-            server.send(500, "text/plain", "Update.end failed");
+            Serial.printf("OTA[END] end() FAILED err=%s size=%u progress=%u\n",
+                Update.errorString(), (unsigned)Update.size(), (unsigned)Update.progress());
+            server.send(500, "text/plain", String("Update.end failed: ") + Update.errorString());
         }
     }
 }
@@ -1028,9 +1079,17 @@ void webConfigSetup() {
     server.on("/api/rules/delete", HTTP_POST, handleDeleteRule);
     server.on("/api/reboot", HTTP_POST, handleReboot);
 
-    /* Firmware OTA update */
+    /* Firmware OTA update.
+     * IMPORTANT: ESP32WebServer requires the upload callback as the 4th arg of
+     * server.on(). Passing it as the plain HTTP_POST handler means it only runs
+     * once at request end — the UPLOAD_FILE_START/WRITE chunks never fire, so
+     * Update.begin()/write() are never called and OTA silently fails with
+     * "Update.end failed: No Error" (because _size stays 0). The correct form is
+     * server.on(PATH, HTTP_POST, finalResponseFn, uploadCallbackFn). */
     server.on("/update", HTTP_GET, handleUpdateGet);
-    server.on("/update", HTTP_POST, handleUpdatePost);
+    server.on("/update", HTTP_POST,
+        []() { /* final response (sent from the upload callback) */ },
+        handleUpdatePost);
 
     server.begin();
     Serial.printf("WebConfig: http://%s/\n", WiFi.localIP().toString().c_str());

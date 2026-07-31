@@ -949,6 +949,7 @@ static void onNatsToolExec(nats_client_t *client, const nats_msg_t *msg,
     if (msg->reply_len > 0) {
         nats_msg_respond_str(client, msg, reply);
     }
+    Serial.printf("[NATS] tool_exec RESULT: %s\n", cmdResponseBuf);
 
     /* Publish brief event for observability */
     if (g_nats_connected) {

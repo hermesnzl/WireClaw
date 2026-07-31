@@ -16,9 +16,15 @@
 #define RULE_NAME_LEN       32
 #define RULE_NATS_SUBJ_LEN  64
 #define RULE_NATS_PAY_LEN   64
+#define RULE_URL_LEN        128
 #define RULE_ID_LEN         12
 #define MAX_PENDING_CHAINS  8
 #define MAX_CHAIN_DEPTH     8
+
+/* When a URL monitor rule cannot reach the host, the reading is set to this
+ * sentinel so COND_LT/eq tests can detect "site down". It sits below any valid
+ * HTTP status code (>=100). */
+#define WIRECLAW_URL_DOWN_READING  0.0f
 
 enum ConditionOp { COND_GT, COND_LT, COND_EQ, COND_NEQ, COND_CHANGE, COND_ALWAYS, COND_CHAINED };
 enum ActionType  { ACT_GPIO_WRITE, ACT_LED_SET, ACT_NATS_PUBLISH, ACT_ACTUATOR, ACT_TELEGRAM, ACT_SERIAL_SEND };
@@ -31,6 +37,7 @@ struct Rule {
     char sensor_name[DEV_NAME_LEN];    /* device name (preferred) */
     uint8_t sensor_pin;                 /* fallback raw GPIO */
     bool sensor_analog;                 /* for raw pin: analogRead vs digitalRead */
+    char sensor_url[RULE_URL_LEN];      /* URL monitor source (empty = not a URL rule) */
 
     /* Condition */
     ConditionOp condition;
@@ -69,6 +76,7 @@ struct Rule {
     bool fired;                         /* runtime only */
     float last_reading;                 /* runtime only */
     uint32_t last_msg_hash;             /* runtime only, for text-aware COND_CHANGE */
+    int32_t last_http_code;             /* runtime only, last HTTP status for URL rules */
     bool enabled;
     bool used;
 };
@@ -96,7 +104,9 @@ const char *ruleCreate(const char *name, const char *sensor_name, uint8_t sensor
                        const char *off_nats_subj, const char *off_nats_pay,
                        /* Chain (optional) */
                        const char *chain_id = nullptr, uint32_t chain_delay_ms = 0,
-                       const char *chain_off_id = nullptr, uint32_t chain_off_delay_ms = 0);
+                       const char *chain_off_id = nullptr, uint32_t chain_off_delay_ms = 0,
+                       /* URL monitor source (optional) */
+                       const char *sensor_url = nullptr);
 
 /* Delete a rule by ID. "all" deletes everything. Returns true if found. */
 bool ruleDelete(const char *id);

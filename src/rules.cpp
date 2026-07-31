@@ -8,6 +8,8 @@
 #include "llm_client.h"
 #include <LittleFS.h>
 #include <nats_esp32.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
 
 /* Externs from main.cpp */
 extern void led(uint8_t r, uint8_t g, uint8_t b);
@@ -76,6 +78,84 @@ static ActionType actionFromString(const char *s) {
 }
 
 /*============================================================================
+ * URL health monitor
+ * A lightweight standalone HTTP GET used by the rule engine to check whether a
+ * website/endpoint is reachable. Returns the HTTP status code (>0) on success,
+ * 0 if the connection succeeded but no valid status was parsed, or -1 on a
+ * connection/timeout failure (i.e. the site is DOWN). TLS cert is NOT verified.
+ *============================================================================*/
+static int urlMonitorCheck(const char *url) {
+    WiFiClientSecure sec;
+    WiFiClient pln;
+    char scheme[8], host[128], path[256];
+    int port = 0;
+
+    /* Minimal URL parse (scheme://host[:port][/path]) */
+    const char *p = url;
+    const char *colon = strchr(url, ':');
+    if (colon && colon[1] == '/' && colon[2] == '/') {
+        int sl = colon - url;
+        if (sl >= (int)sizeof(scheme)) sl = sizeof(scheme) - 1;
+        memcpy(scheme, url, sl); scheme[sl] = '\0';
+        p = colon + 3;
+    } else {
+        strcpy(scheme, "http");
+    }
+    int hl = 0;
+    while (*p && *p != ':' && *p != '/' && hl < (int)sizeof(host) - 1) host[hl++] = *p++;
+    host[hl] = '\0';
+    if (*p == ':') {
+        p++;
+        port = atoi(p);
+        while (*p && *p != '/') p++;
+    } else {
+        port = (strcmp(scheme, "https") == 0) ? 443 : 80;
+    }
+    if (*p == '/') {
+        int pl = 0;
+        while (*p && pl < (int)sizeof(path) - 1) path[pl++] = *p++;
+        path[pl] = '\0';
+    } else {
+        strcpy(path, "/");
+    }
+    if (host[0] == '\0') return -1;
+
+    bool https = (strcmp(scheme, "https") == 0);
+    Client *c;
+    if (https) {
+        sec.setInsecure();
+        sec.setTimeout(10);
+        if (!sec.connect(host, port)) return -1;
+        c = &sec;
+    } else {
+        pln.setTimeout(10);
+        if (!pln.connect(host, port)) return -1;
+        c = &pln;
+    }
+
+    char req[400];
+    int rl = snprintf(req, sizeof(req),
+        "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: WireClaw\r\n"
+        "Accept: */*\r\nConnection: close\r\n\r\n", path, host);
+    c->write((const uint8_t *)req, rl);
+
+    unsigned long t0 = millis();
+    while (!c->available()) {
+        if (!c->connected()) { c->stop(); return -1; }
+        if (millis() - t0 > 10000) { c->stop(); return -1; }
+        delay(20);
+    }
+    String status = c->readStringUntil('\n');
+    c->stop();
+    /* Status line looks like "HTTP/1.1 200 OK" -> extract 3-digit code */
+    int sp1 = status.indexOf(' ');
+    if (sp1 < 0) return 0;
+    int code = status.substring(sp1 + 1, sp1 + 4).toInt();
+    return code > 0 ? code : 0;
+}
+
+
+/*============================================================================
  * CRUD
  *============================================================================*/
 
@@ -101,7 +181,8 @@ const char *ruleCreate(const char *name, const char *sensor_name, uint8_t sensor
                        uint8_t off_pin, int32_t off_value,
                        const char *off_nats_subj, const char *off_nats_pay,
                        const char *chain_id, uint32_t chain_delay_ms,
-                       const char *chain_off_id, uint32_t chain_off_delay_ms) {
+                       const char *chain_off_id, uint32_t chain_off_delay_ms,
+                       const char *sensor_url) {
     /* Find free slot */
     int slot = -1;
     for (int i = 0; i < MAX_RULES; i++) {
@@ -126,6 +207,13 @@ const char *ruleCreate(const char *name, const char *sensor_name, uint8_t sensor
         r->sensor_name[0] = '\0';
         r->sensor_pin = sensor_pin;
         r->sensor_analog = sensor_analog;
+    }
+
+    /* URL monitor source (optional) */
+    r->sensor_url[0] = '\0';
+    if (sensor_url && sensor_url[0]) {
+        strncpy(r->sensor_url, sensor_url, RULE_URL_LEN - 1);
+        r->sensor_url[RULE_URL_LEN - 1] = '\0';
     }
 
     r->condition = condition;
@@ -250,6 +338,19 @@ static void interpolateMessage(const char *tmpl, const Rule *r,
                 if (strcmp(varname, "value") == 0) {
                     val = r->last_reading;
                     found = true;
+                    /* For URL monitor rules, render a human-friendly value
+                     * instead of the raw 0/200+ number. */
+                    if (r->sensor_url[0]) {
+                        char urlval[48];
+                        if (val < 1.0f)
+                            snprintf(urlval, sizeof(urlval), "DOWN");
+                        else
+                            snprintf(urlval, sizeof(urlval), "HTTP %d",
+                                     (int)val);
+                        w += snprintf(out + w, out_len - w, "%s", urlval);
+                        p = end + 1;
+                        continue;
+                    }
                 } else {
                     Device *dev = deviceFind(varname);
                     if (dev && deviceIsSensor(dev->kind)) {
@@ -470,7 +571,26 @@ void rulesEvaluate() {
 
         /* Read sensor (with cache for named devices) */
         float reading = 0.0f;
-        if (r->sensor_name[0]) {
+        bool is_url_rule = (r->sensor_url[0] != '\0');
+
+        if (is_url_rule) {
+            /* URL monitor: perform an HTTP GET.
+             * reading = http code (>=100). Down conditions tested below. */
+            int code = urlMonitorCheck(r->sensor_url);
+            r->last_http_code = code;
+            if (code < 0) {
+                /* Connection failed -> site is down. Use 0 as the "down" reading
+                 * so COND_LT / COND_EQ(0) match; keep threshold semantics simple. */
+                reading = WIRECLAW_URL_DOWN_READING;
+                if (g_debug)
+                    Serial.printf("[Rule] %s: URL check FAILED (%s)\n", r->id, r->sensor_url);
+            } else {
+                reading = (float)code;
+                if (g_debug)
+                    Serial.printf("[Rule] %s: URL %s -> HTTP %d\n",
+                                  r->id, r->sensor_url, code);
+            }
+        } else if (r->sensor_name[0]) {
             /* Check cache first */
             bool found = false;
             for (int c = 0; c < cacheCount; c++) {
@@ -653,7 +773,7 @@ void rulesSave() {
             "\"ho\":%s,\"fa\":\"%s\",\"fac\":\"%s\",\"fp\":%d,\"fv\":%d,"
             "\"fns\":\"%s\",\"fnp\":\"%s\","
             "\"ci\":\"%s\",\"cd\":%u,\"coi\":\"%s\",\"cod\":%u,"
-            "\"en\":%s,\"lt\":%u}",
+            "\"su\":\"%s\",\"en\":%s,\"lt\":%u}",
             r->id, r->name, r->sensor_name, r->sensor_pin,
             r->sensor_analog ? "true" : "false",
             conditionOpName(r->condition), (int)r->threshold, (unsigned)r->interval_ms,
@@ -664,6 +784,7 @@ void rulesSave() {
             r->off_nats_subj, r->off_nats_pay,
             r->chain_id, (unsigned)r->chain_delay_ms,
             r->chain_off_id, (unsigned)r->chain_off_delay_ms,
+            r->sensor_url,
             r->enabled ? "true" : "false",
             (unsigned)r->last_triggered);
 
@@ -748,6 +869,9 @@ static void rulesLoad() {
         ruleJsonGetString(objBuf, "coi", r->chain_off_id, RULE_ID_LEN);
         r->chain_off_delay_ms = (uint32_t)ruleJsonGetInt(objBuf, "cod", 0);
 
+        ruleJsonGetString(objBuf, "su", r->sensor_url, RULE_URL_LEN);
+
+        r->last_http_code = 0;
         r->enabled = ruleJsonGetBool(objBuf, "en", true);
         r->last_triggered = (uint32_t)ruleJsonGetInt(objBuf, "lt", 0);
         r->fired = false;

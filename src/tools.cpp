@@ -15,6 +15,7 @@
 #include <LittleFS.h>
 #include <nats_esp32.h>
 #include <esp_task_wdt.h>
+#include "ping/ping_sock.h"
 #if !defined(CONFIG_IDF_TARGET_ESP32)
 #include "driver/temperature_sensor.h"
 #endif
@@ -104,13 +105,13 @@ static const char *TOOLS_JSON = R"JSON([
 {"type":"function","function":{"name":"device_remove","description":"Remove device by name","parameters":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}},
 {"type":"function","function":{"name":"sensor_read","description":"Read named sensor value","parameters":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}},
 {"type":"function","function":{"name":"actuator_set","description":"Set actuator value","parameters":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"integer"}},"required":["name","value"]}}},
-{"type":"function","function":{"name":"rule_create","description":"Create automation rule. Use chained condition for chain-only targets.","parameters":{"type":"object","properties":{"rule_name":{"type":"string"},"sensor_name":{"type":"string"},"sensor_pin":{"type":"integer"},"condition":{"type":"string","description":"gt|lt|eq|neq|change|always|chained"},"threshold":{"type":"integer"},"interval_seconds":{"type":"integer"},"actuator_name":{"type":"string"},"on_action":{"type":"string","description":"gpio_write|led_set|nats_publish|actuator|telegram|serial_send"},"on_pin":{"type":"integer"},"on_value":{"type":"integer"},"on_r":{"type":"integer"},"on_g":{"type":"integer"},"on_b":{"type":"integer"},"on_nats_subject":{"type":"string"},"on_nats_payload":{"type":"string"},"on_telegram_message":{"type":"string","description":"Use {value} or {device_name}"},"on_serial_text":{"type":"string","description":"Text to send via serial_text UART"},"off_action":{"type":"string","description":"auto|none|gpio_write|led_set|nats_publish|actuator|telegram|serial_send"},"off_pin":{"type":"integer"},"off_value":{"type":"integer"},"off_r":{"type":"integer"},"off_g":{"type":"integer"},"off_b":{"type":"integer"},"off_nats_subject":{"type":"string"},"off_nats_payload":{"type":"string"},"off_telegram_message":{"type":"string"},"off_serial_text":{"type":"string","description":"Text for serial off-action"},"chain_rule":{"type":"string","description":"Rule ID to trigger after ON action (e.g. rule_01)"},"chain_delay_seconds":{"type":"integer","description":"Delay before ON chain fires (0=immediate)"},"chain_off_rule":{"type":"string","description":"Rule ID to trigger after OFF action"},"chain_off_delay_seconds":{"type":"integer","description":"Delay before OFF chain fires (0=immediate)"}},"required":["rule_name"]}}},
+{"type":"function","function":{"name":"rule_create","description":"Create automation rule. Sources: a device sensor, a raw GPIO pin, a URL to monitor (HTTP GET every interval, fires when the site is down), or chained. Use chained condition for chain-only targets.","parameters":{"type":"object","properties":{"rule_name":{"type":"string"},"sensor_name":{"type":"string"},"sensor_pin":{"type":"integer"},"sensor_url":{"type":"string","description":"URL to monitor (e.g. https://example.com). If set, the rule performs an HTTP GET on its interval; site down (no response or HTTP<200) makes the reading 0 so e.g. condition lt 200 fires. Ignores sensor_name/sensor_pin."},"condition":{"type":"string","description":"gt|lt|eq|neq|change|always|chained. For URL monitoring, default lt with threshold 200 means 'alert when down'."},"threshold":{"type":"integer"},"interval_seconds":{"type":"integer","description":"How often to check. Min 5s. For URL monitoring this is the poll period."},"actuator_name":{"type":"string"},"on_action":{"type":"string","description":"gpio_write|led_set|nats_publish|actuator|telegram|serial_send"},"on_pin":{"type":"integer"},"on_value":{"type":"integer"},"on_r":{"type":"integer"},"on_g":{"type":"integer"},"on_b":{"type":"integer"},"on_nats_subject":{"type":"string"},"on_nats_payload":{"type":"string"},"on_telegram_message":{"type":"string","description":"Use {value} or {device_name}"},"on_serial_text":{"type":"string","description":"Text to send via serial_text UART"},"off_action":{"type":"string","description":"auto|none|gpio_write|led_set|nats_publish|actuator|telegram|serial_send"},"off_pin":{"type":"integer"},"off_value":{"type":"integer"},"off_r":{"type":"integer"},"off_g":{"type":"integer"},"off_b":{"type":"integer"},"off_nats_subject":{"type":"string"},"off_nats_payload":{"type":"string"},"off_telegram_message":{"type":"string"},"off_serial_text":{"type":"string","description":"Text for serial off-action"},"chain_rule":{"type":"string","description":"Rule ID to trigger after ON action (e.g. rule_01)"},"chain_delay_seconds":{"type":"integer","description":"Delay before ON chain fires (0=immediate)"},"chain_off_rule":{"type":"string","description":"Rule ID to trigger after OFF action"},"chain_off_delay_seconds":{"type":"integer","description":"Delay before OFF chain fires (0=immediate)"}},"required":["rule_name"]}}},
 {"type":"function","function":{"name":"rule_list","description":"List all rules","parameters":{"type":"object","properties":{}}}},
 {"type":"function","function":{"name":"rule_delete","description":"Delete rule by ID (e.g. rule_01), or pass 'all' to delete every rule at once.","parameters":{"type":"object","properties":{"rule_id":{"type":"string","description":"Rule ID or 'all'"}},"required":["rule_id"]}}},
 {"type":"function","function":{"name":"rule_enable","description":"Enable/disable rule","parameters":{"type":"object","properties":{"rule_id":{"type":"string"},"enabled":{"type":"boolean"}},"required":["rule_id","enabled"]}}},
 {"type":"function","function":{"name":"serial_send","description":"Send text over serial_text UART","parameters":{"type":"object","properties":{"text":{"type":"string","description":"Text to send (newline appended)"}},"required":["text"]}}},
 {"type":"function","function":{"name":"remote_chat","description":"Chat with another WireClaw device via NATS","parameters":{"type":"object","properties":{"device":{"type":"string"},"message":{"type":"string"}},"required":["device","message"]}}},
-{"type":"function","function":{"name":"ping","description":"TCP reachability probe to host:port (like ping/nc -zv). Reports OK + connect latency or unreachable. Use for host-up checks.","parameters":{"type":"object","properties":{"host":{"type":"string","description":"Hostname or IP (or pass url)"},"url":{"type":"string","description":"Optional URL; port derived from scheme if host omitted"},"port":{"type":"integer","description":"Port to probe (default 80, 443 if https url)"}},"required":[]}}},
+{"type":"function","function":{"name":"ping","description":"Host reachability probe. If 'port' is given, does a single TCP connect to that port (service liveness check). If no port is given, probes common ports (443,80,22,53,21,25,3389) and reports the first that answers, so it works for any host, not just web servers. Use for host-up checks.","parameters":{"type":"object","properties":{"host":{"type":"string","description":"Hostname or IP (or pass url)"},"url":{"type":"string","description":"Optional URL; port derived from scheme if host omitted"},"port":{"type":"integer","description":"Port to probe. If omitted, probes common ports to determine if host is up."}},"required":[]}}},
 {"type":"function","function":{"name":"curl","description":"HTTP GET/HEAD a URL and return the status, headers and body (truncated). TLS certificate is NOT verified. Use to check if a website is up.","parameters":{"type":"object","properties":{"url":{"type":"string"},"method":{"type":"string","description":"GET (default) or HEAD"},"insecure":{"type":"boolean","description":"Ignore TLS cert (default true)"},"show_headers":{"type":"boolean","description":"Include response headers (default true)"}},"required":["url"]}}},
 {"type":"function","function":{"name":"wget","description":"HTTP GET a URL and save the body to a LittleFS file. TLS certificate is NOT verified.","parameters":{"type":"object","properties":{"url":{"type":"string"},"path":{"type":"string","description":"Destination path e.g. /download.html"},"insecure":{"type":"boolean","description":"Ignore TLS cert (default true)"}},"required":["url","path"]}}},
 {"type":"function","function":{"name":"chain_create","description":"Create multi-step automation chain (up to 5 steps) in one call. Steps execute in order with delays.","parameters":{"type":"object","properties":{"sensor_name":{"type":"string","description":"Sensor to monitor"},"condition":{"type":"string","description":"gt|lt|eq|neq|change|always"},"threshold":{"type":"integer"},"interval_seconds":{"type":"integer"},"step1_action":{"type":"string","description":"telegram|led_set|gpio_write|nats_publish|actuator|serial_send"},"step1_message":{"type":"string","description":"For telegram/nats/serial_send"},"step1_r":{"type":"integer"},"step1_g":{"type":"integer"},"step1_b":{"type":"integer"},"step1_pin":{"type":"integer"},"step1_value":{"type":"integer"},"step1_actuator":{"type":"string"},"step1_nats_subject":{"type":"string"},"step2_action":{"type":"string","description":"Action after step1"},"step2_delay":{"type":"integer","description":"Seconds before step2"},"step2_message":{"type":"string"},"step2_r":{"type":"integer"},"step2_g":{"type":"integer"},"step2_b":{"type":"integer"},"step2_pin":{"type":"integer"},"step2_value":{"type":"integer"},"step2_actuator":{"type":"string"},"step2_nats_subject":{"type":"string"},"step3_action":{"type":"string","description":"Step3 (optional)"},"step3_delay":{"type":"integer","description":"Seconds before step3"},"step3_message":{"type":"string"},"step3_r":{"type":"integer"},"step3_g":{"type":"integer"},"step3_b":{"type":"integer"},"step3_pin":{"type":"integer"},"step3_value":{"type":"integer"},"step3_actuator":{"type":"string"},"step3_nats_subject":{"type":"string"},"step4_action":{"type":"string","description":"Step4 (optional)"},"step4_delay":{"type":"integer","description":"Seconds before step4"},"step4_message":{"type":"string"},"step4_r":{"type":"integer"},"step4_g":{"type":"integer"},"step4_b":{"type":"integer"},"step4_pin":{"type":"integer"},"step4_value":{"type":"integer"},"step4_actuator":{"type":"string"},"step4_nats_subject":{"type":"string"},"step5_action":{"type":"string","description":"Step5 (optional)"},"step5_delay":{"type":"integer","description":"Seconds before step5"},"step5_message":{"type":"string"},"step5_r":{"type":"integer"},"step5_g":{"type":"integer"},"step5_b":{"type":"integer"},"step5_pin":{"type":"integer"},"step5_value":{"type":"integer"},"step5_actuator":{"type":"string"},"step5_nats_subject":{"type":"string"}},"required":["sensor_name","condition","threshold","step1_action","step2_action"]}}}
@@ -521,22 +522,32 @@ static void tool_rule_create(const char *args, char *result, int result_len) {
     jsonArgString(args, "sensor_name", sensor_name, sizeof(sensor_name));
     uint8_t sensor_pin = (uint8_t)jsonArgInt(args, "sensor_pin", PIN_NONE);
 
+    /* URL monitor source (optional). When set, the rule pings a URL on its
+     * interval and fires based on the HTTP status (down -> reading 0). */
+    char sensor_url[RULE_URL_LEN] = "";
+    jsonArgString(args, "sensor_url", sensor_url, sizeof(sensor_url));
+
     char cond_str[16];
+    int32_t threshold = jsonArgInt(args, "threshold", 0);
     if (!jsonArgString(args, "condition", cond_str, sizeof(cond_str))) {
         /* Default to "chained" if no condition and no sensor source */
-        if (!sensor_name[0] && sensor_pin == PIN_NONE) {
+        if (!sensor_name[0] && sensor_pin == PIN_NONE && !sensor_url[0]) {
             strcpy(cond_str, "chained");
+        } else if (sensor_url[0]) {
+            /* Sensible default for URL monitoring: fire when the site is down
+             * (HTTP status < 200). */
+            strcpy(cond_str, "lt");
+            threshold = 200;
         } else {
             snprintf(result, result_len, "Error: missing 'condition'");
             return;
         }
     }
     ConditionOp condition = parseConditionOp(cond_str);
-    int32_t threshold = jsonArgInt(args, "threshold", 0);
     bool sensor_analog = false;
 
-    /* Validate sensor source (not required for COND_CHAINED) */
-    if (condition != COND_CHAINED) {
+    /* Validate sensor source (not required for COND_CHAINED or URL rules) */
+    if (condition != COND_CHAINED && !sensor_url[0]) {
         if (sensor_name[0]) {
             Device *dev = deviceFind(sensor_name);
             if (!dev) {
@@ -548,7 +559,7 @@ static void tool_rule_create(const char *args, char *result, int result_len) {
                 return;
             }
         } else if (sensor_pin == PIN_NONE) {
-            snprintf(result, result_len, "Error: provide sensor_name or sensor_pin");
+            snprintf(result, result_len, "Error: provide sensor_name, sensor_pin, or sensor_url");
             return;
         }
     }
@@ -693,7 +704,8 @@ static void tool_rule_create(const char *args, char *result, int result_len) {
                                 has_off, off_action, off_actuator,
                                 off_pin, off_value, off_nats_subj, off_nats_pay,
                                 chain_rule, chain_delay_ms,
-                                chain_off_rule, chain_off_delay_ms);
+                                chain_off_rule, chain_off_delay_ms,
+                                sensor_url);
 
     if (!id) {
         snprintf(result, result_len, "Error: rule creation failed (max %d rules)", MAX_RULES);
@@ -977,6 +989,42 @@ static int netHttp(const char *url, bool head, char *buf, int buf_len) {
     return code;
 }
 
+/* --- Real ICMP echo ping via the IDF esp_ping component (liblwip) --- */
+namespace {
+    /* Synchronous bridge: the esp_ping API is callback/thread based, so we
+     * collect the result in globals and block on a semaphore until done. */
+    SemaphoreHandle_t g_pingSem = nullptr;
+    volatile bool    g_pingDone = false;
+    volatile int     g_pingSent = 0;
+    volatile int     g_pingRecv = 0;
+    volatile uint32_t g_pingMinMs = 0xFFFFFFFF;
+    volatile uint32_t g_pingMaxMs = 0;
+    volatile uint32_t g_pingSumMs = 0;
+
+    void ping_on_success(esp_ping_handle_t hdl, void *args) {
+        uint32_t t = 0, seq = 0;
+        esp_ping_get_profile(hdl, ESP_PING_PROF_TIMEGAP, &t, sizeof(t));
+        esp_ping_get_profile(hdl, ESP_PING_PROF_SEQNO,  &seq, sizeof(seq));
+        (void)seq;
+        g_pingRecv++;
+        g_pingSumMs += t;
+        if (t < g_pingMinMs) g_pingMinMs = t;
+        if (t > g_pingMaxMs) g_pingMaxMs = t;
+    }
+    void ping_on_timeout(esp_ping_handle_t hdl, void *args) {
+        /* counts as a lost packet; nothing else to do */
+        (void)hdl; (void)args;
+    }
+    void ping_on_end(esp_ping_handle_t hdl, void *args) {
+        (void)hdl; (void)args;
+        /* Read totals for the summary. */
+        esp_ping_get_profile(hdl, ESP_PING_PROF_REQUEST, (void*)&g_pingSent, sizeof(g_pingSent));
+        esp_ping_get_profile(hdl, ESP_PING_PROF_REPLY,   (void*)&g_pingRecv, sizeof(g_pingRecv));
+        g_pingDone = true;
+        if (g_pingSem) xSemaphoreGive(g_pingSem);
+    }
+}
+
 static void tool_ping(const char *args, char *result, int result_len) {
     char host[128];
     if (!jsonArgString(args, "host", host, sizeof(host))) {
@@ -985,29 +1033,80 @@ static void tool_ping(const char *args, char *result, int result_len) {
             return;
         }
     }
-    int port = jsonArgInt(args, "port", 0);
-    if (port == 0) {
-        char scheme[8];
-        const char *c = strchr(host, ':');
-        if (c && c[1] == '/' && c[2] == '/') {
-            int sl = c - host; if (sl >= (int)sizeof(scheme)) sl = sizeof(scheme) - 1;
-            memcpy(scheme, host, sl); scheme[sl] = '\0';
-            port = (strcmp(scheme, "https") == 0) ? 443 : 80;
-        } else {
-            port = 80;
+
+    /* Resolve the host (IP literal or DNS). */
+    IPAddress target;
+    if (!target.fromString(host)) {
+        /* try DNS */
+        WiFi.hostByName(host, target);
+        if (target == IPAddress(0,0,0,0)) {
+            snprintf(result, result_len, "FAIL: cannot resolve %s", host);
+            return;
         }
     }
-    WiFiClient conn;
-    conn.setTimeout(5000);
-    unsigned long t0 = millis();
-    bool ok = conn.connect(host, port);
-    unsigned long dt = millis() - t0;
-    if (ok) {
-        snprintf(result, result_len, "OK %s:%d reachable, %lums", host, port, dt);
-        conn.stop();
-    } else {
-        snprintf(result, result_len, "FAIL %s:%d unreachable", host, port);
+
+    int count = jsonArgInt(args, "count", 4);
+    if (count < 1) count = 1; else if (count > 20) count = 20;
+    int timeout_ms = jsonArgInt(args, "timeout", 2000);
+    if (timeout_ms < 100) timeout_ms = 100; else if (timeout_ms > 10000) timeout_ms = 10000;
+
+    /* reset accumulators */
+    if (!g_pingSem) g_pingSem = xSemaphoreCreateBinary();
+    g_pingDone = false; g_pingSent = 0; g_pingRecv = 0;
+    g_pingMinMs = 0xFFFFFFFF; g_pingMaxMs = 0; g_pingSumMs = 0;
+
+    esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
+    cfg.count = (uint32_t)count;
+    cfg.interval_ms = 1000;
+    cfg.timeout_ms = (uint32_t)timeout_ms;
+    cfg.data_size = 32;
+    cfg.target_addr.type = IPADDR_TYPE_V4;
+    cfg.target_addr.u_addr.ip4.addr = target; /* already network byte order */
+
+    esp_ping_callbacks_t cbs = {
+        .cb_args = nullptr,
+        .on_ping_success = ping_on_success,
+        .on_ping_timeout = ping_on_timeout,
+        .on_ping_end = ping_on_end,
+    };
+
+    esp_ping_handle_t hdl = nullptr;
+    esp_err_t err = esp_ping_new_session(&cfg, &cbs, &hdl);
+    if (err != ESP_OK || !hdl) {
+        snprintf(result, result_len, "FAIL: esp_ping_new_session error 0x%x", err);
+        return;
     }
+
+    err = esp_ping_start(hdl);
+    if (err != ESP_OK) {
+        esp_ping_delete_session(hdl);
+        snprintf(result, result_len, "FAIL: esp_ping_start error 0x%x", err);
+        return;
+    }
+
+    /* Block until the session ends (or a safety timeout). */
+    uint32_t wait_ms = (count * (timeout_ms + 1100)) + 2000;
+    bool done = (xSemaphoreTake(g_pingSem, pdMS_TO_TICKS(wait_ms)) == pdTRUE);
+    esp_ping_stop(hdl);
+    esp_ping_delete_session(hdl);
+    (void)done; /* if semaphore lost, we still report what the callbacks collected */
+
+    unsigned long avg = g_pingRecv ? (g_pingSumMs / g_pingRecv) : 0;
+    char ipstr[16];
+    snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u",
+             target[0], target[1], target[2], target[3]);
+
+    if (g_pingRecv == 0) {
+        snprintf(result, result_len,
+                 "FAIL: %s (%s) unreachable — 0/%d ICMP replies, %ums timeout each",
+                 host, ipstr, count, timeout_ms);
+        return;
+    }
+
+    snprintf(result, result_len,
+             "OK: %s (%s) — %d/%d packets, %lums min / %lums avg / %lums max",
+             host, ipstr, g_pingRecv, count,
+             (g_pingMinMs == 0xFFFFFFFF ? 0 : g_pingMinMs), avg, g_pingMaxMs);
 }
 
 static void tool_curl(const char *args, char *result, int result_len) {

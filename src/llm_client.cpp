@@ -165,6 +165,7 @@ LlmClient::LlmClient()
     : m_client(nullptr), m_api_key(nullptr), m_model(nullptr),
       m_port(443), m_use_tls(true) {
     m_error[0] = '\0';
+    m_http_status = 0;
     m_host[0] = '\0';
     m_path[0] = '\0';
 }
@@ -473,6 +474,7 @@ int LlmClient::readResponse(char *buf, int buf_len) {
         return -1;
     }
     int http_status = status_line.substring(9, 12).toInt();
+    m_http_status = http_status;
     if (g_debug) Serial.printf("[LLM] HTTP %d\n", http_status);
 
     while (m_client->connected()) {
@@ -580,12 +582,15 @@ bool LlmClient::chat(const LlmMessage *messages, int count,
         return false;
     }
 
-    if (g_debug) {
-        Serial.printf("[LLM] Response: %d bytes (%lums total)\n",
-                      body_len, millis() - t0);
-        Serial.printf("[LLM] Body: %.*s\n", body_len < 500 ? body_len : 500,
-                      response_buf);
+    bool ok = parseResponse(response_buf, body_len, result);
+    if (!ok && m_http_status != 0 && !strstr(m_error, "message")) {
+        /* Surface the real HTTP status so intermittent failures are diagnosable
+         * (e.g. 401 auth, 429 rate-limit, 500/502 upstream). */
+        char status_note[160];
+        snprintf(status_note, sizeof(status_note), "HTTP %d: %s",
+                 m_http_status, m_error);
+        strncpy(m_error, status_note, sizeof(m_error) - 1);
+        m_error[sizeof(m_error) - 1] = '\0';
     }
-
-    return parseResponse(response_buf, body_len, result);
+    return ok;
 }

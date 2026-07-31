@@ -92,6 +92,7 @@ private:
     char m_path[64];
     bool m_use_tls;
     char m_error[128];
+    int  m_http_status;   /* last HTTP status code from readResponse */
 
     int buildRequest(char *buf, int buf_len,
                      const LlmMessage *messages, int count,
