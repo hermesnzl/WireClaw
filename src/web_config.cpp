@@ -8,6 +8,7 @@
 
 #include "web_config.h"
 #include <WebServer.h>
+#include <Update.h>
 #include <ESPmDNS.h>
 #include <WiFi.h>
 #include <LittleFS.h>
@@ -572,6 +573,9 @@ font-weight:500;padding:0.5rem 1rem;cursor:pointer;border-radius:8px 8px 0 0;
 border-bottom:2px solid transparent;transition:all 0.15s}
 nav button:hover{color:var(--text)}
 nav button.active{color:var(--accent);border-bottom-color:var(--accent)}
+nav .navlink{margin-left:auto;display:inline-flex;align-items:center;background:var(--accent-dim);
+color:var(--accent);font-size:0.8rem;font-weight:600;text-decoration:none;padding:0.4rem 0.9rem;
+border-radius:8px;border:1px solid var(--border-a)}
 .tab{display:none}.tab.active{display:block}
 .card{background:var(--bg3);border:1px solid var(--border);border-radius:12px;padding:1.5rem;margin-bottom:1rem}
 label{display:block;font-size:0.8rem;color:var(--accent);font-weight:600;margin:1rem 0 0.25rem;
@@ -648,6 +652,7 @@ nav button{padding:0.4rem 0.6rem;font-size:0.8rem}
 <button onclick="showTab('devices')">Devices</button>
 <button onclick="showTab('rules')">Rules</button>
 <button onclick="showTab('status')">Status</button>
+<a class="navlink" href="/update">Firmware Update</a>
 </nav>
 
 <div id="config" class="tab active">
@@ -893,6 +898,66 @@ document.getElementById('hdr-ver').textContent='v'+d.version;
  * Setup & Loop
  *============================================================================*/
 
+/*============================================================================
+ * Firmware OTA update (/update)
+ * Classic WebServer upload handler. POSTs the new firmware .bin to /update,
+ * streams it into the inactive OTA partition via Update, then reboots.
+ *============================================================================*/
+
+static void handleUpdateGet() {
+    String html = F(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>WireClaw Firmware Update</title>"
+        "<style>body{font-family:sans-serif;margin:2em;max-width:40em}"
+        "h1{font-size:1.4em}input[type=file]{margin:1em 0}button{padding:.5em 1em}"
+        "#s{margin-top:1em;white-space:pre-wrap}</style></head><body>"
+        "<h1>WireClaw Firmware Update</h1>"
+        "<p>Select a <b>firmware.bin</b> (app image) and upload it. The device "
+        "writes it to the inactive OTA partition and reboots automatically.</p>"
+        "<form method=\"post\" enctype=\"multipart/form-data\" action=\"/update\" "
+        "onsubmit=\"document.getElementById('b').disabled=true;document.getElementById('s').textContent='Uploading...';\">"
+        "<input type=\"file\" name=\"firmware\" accept=\".bin\" required><br>"
+        "<button id=\"b\" type=\"submit\">Upload &amp; Flash</button></form>"
+        "<div id=\"s\"></div></body></html>");
+    server.send(200, "text/html", html);
+}
+
+static void handleUpdatePost() {
+    HTTPUpload& upload = server.upload();
+    static size_t expected = 0;
+    static size_t received = 0;
+
+    if (upload.status == UPLOAD_FILE_START) {
+        received = 0;
+        expected = upload.totalSize;
+        Serial.printf("OTA: start (%u bytes)\n", expected);
+        if (!Update.begin(expected, U_FLASH)) {
+            Update.printError(Serial);
+            server.send(500, "text/plain", "Update.begin failed");
+            return;
+        }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (upload.currentSize > 0) {
+            if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+                Update.printError(Serial);
+                server.send(500, "text/plain", "Update.write failed");
+                return;
+            }
+            received += upload.currentSize;
+        }
+    } else if (upload.status == UPLOAD_FILE_END) {
+        if (Update.end(true)) {
+            Serial.printf("OTA: success %u bytes, rebooting\n", received);
+            server.send(200, "text/plain",
+                "Update successful (" + String(received) + " bytes). Rebooting...");
+            delay(500);
+            ESP.restart();
+        } else {
+            Update.printError(Serial);
+            server.send(500, "text/plain", "Update.end failed");
+        }
+    }
+}
+
 void webConfigSetup() {
     /* mDNS */
     if (MDNS.begin(cfg_device_name)) {
@@ -919,6 +984,10 @@ void webConfigSetup() {
     server.on("/api/rules", HTTP_GET, handleGetRules);
     server.on("/api/rules/delete", HTTP_POST, handleDeleteRule);
     server.on("/api/reboot", HTTP_POST, handleReboot);
+
+    /* Firmware OTA update */
+    server.on("/update", HTTP_GET, handleUpdateGet);
+    server.on("/update", HTTP_POST, handleUpdatePost);
 
     server.begin();
     Serial.printf("WebConfig: http://%s/\n", WiFi.localIP().toString().c_str());
