@@ -10,6 +10,7 @@
 #include "rules.h"
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include "soc/soc_caps.h"
 #include <LittleFS.h>
 #include <nats_esp32.h>
@@ -109,6 +110,9 @@ static const char *TOOLS_JSON = R"JSON([
 {"type":"function","function":{"name":"rule_enable","description":"Enable/disable rule","parameters":{"type":"object","properties":{"rule_id":{"type":"string"},"enabled":{"type":"boolean"}},"required":["rule_id","enabled"]}}},
 {"type":"function","function":{"name":"serial_send","description":"Send text over serial_text UART","parameters":{"type":"object","properties":{"text":{"type":"string","description":"Text to send (newline appended)"}},"required":["text"]}}},
 {"type":"function","function":{"name":"remote_chat","description":"Chat with another WireClaw device via NATS","parameters":{"type":"object","properties":{"device":{"type":"string"},"message":{"type":"string"}},"required":["device","message"]}}},
+{"type":"function","function":{"name":"ping","description":"TCP reachability probe to host:port (like ping/nc -zv). Reports OK + connect latency or unreachable. Use for host-up checks.","parameters":{"type":"object","properties":{"host":{"type":"string","description":"Hostname or IP (or pass url)"},"url":{"type":"string","description":"Optional URL; port derived from scheme if host omitted"},"port":{"type":"integer","description":"Port to probe (default 80, 443 if https url)"}},"required":[]}}},
+{"type":"function","function":{"name":"curl","description":"HTTP GET/HEAD a URL and return the status, headers and body (truncated). TLS certificate is NOT verified. Use to check if a website is up.","parameters":{"type":"object","properties":{"url":{"type":"string"},"method":{"type":"string","description":"GET (default) or HEAD"},"insecure":{"type":"boolean","description":"Ignore TLS cert (default true)"},"show_headers":{"type":"boolean","description":"Include response headers (default true)"}},"required":["url"]}}},
+{"type":"function","function":{"name":"wget","description":"HTTP GET a URL and save the body to a LittleFS file. TLS certificate is NOT verified.","parameters":{"type":"object","properties":{"url":{"type":"string"},"path":{"type":"string","description":"Destination path e.g. /download.html"},"insecure":{"type":"boolean","description":"Ignore TLS cert (default true)"}},"required":["url","path"]}}},
 {"type":"function","function":{"name":"chain_create","description":"Create multi-step automation chain (up to 5 steps) in one call. Steps execute in order with delays.","parameters":{"type":"object","properties":{"sensor_name":{"type":"string","description":"Sensor to monitor"},"condition":{"type":"string","description":"gt|lt|eq|neq|change|always"},"threshold":{"type":"integer"},"interval_seconds":{"type":"integer"},"step1_action":{"type":"string","description":"telegram|led_set|gpio_write|nats_publish|actuator|serial_send"},"step1_message":{"type":"string","description":"For telegram/nats/serial_send"},"step1_r":{"type":"integer"},"step1_g":{"type":"integer"},"step1_b":{"type":"integer"},"step1_pin":{"type":"integer"},"step1_value":{"type":"integer"},"step1_actuator":{"type":"string"},"step1_nats_subject":{"type":"string"},"step2_action":{"type":"string","description":"Action after step1"},"step2_delay":{"type":"integer","description":"Seconds before step2"},"step2_message":{"type":"string"},"step2_r":{"type":"integer"},"step2_g":{"type":"integer"},"step2_b":{"type":"integer"},"step2_pin":{"type":"integer"},"step2_value":{"type":"integer"},"step2_actuator":{"type":"string"},"step2_nats_subject":{"type":"string"},"step3_action":{"type":"string","description":"Step3 (optional)"},"step3_delay":{"type":"integer","description":"Seconds before step3"},"step3_message":{"type":"string"},"step3_r":{"type":"integer"},"step3_g":{"type":"integer"},"step3_b":{"type":"integer"},"step3_pin":{"type":"integer"},"step3_value":{"type":"integer"},"step3_actuator":{"type":"string"},"step3_nats_subject":{"type":"string"},"step4_action":{"type":"string","description":"Step4 (optional)"},"step4_delay":{"type":"integer","description":"Seconds before step4"},"step4_message":{"type":"string"},"step4_r":{"type":"integer"},"step4_g":{"type":"integer"},"step4_b":{"type":"integer"},"step4_pin":{"type":"integer"},"step4_value":{"type":"integer"},"step4_actuator":{"type":"string"},"step4_nats_subject":{"type":"string"},"step5_action":{"type":"string","description":"Step5 (optional)"},"step5_delay":{"type":"integer","description":"Seconds before step5"},"step5_message":{"type":"string"},"step5_r":{"type":"integer"},"step5_g":{"type":"integer"},"step5_b":{"type":"integer"},"step5_pin":{"type":"integer"},"step5_value":{"type":"integer"},"step5_actuator":{"type":"string"},"step5_nats_subject":{"type":"string"}},"required":["sensor_name","condition","threshold","step1_action","step2_action"]}}}
 ])JSON";
 
@@ -859,6 +863,248 @@ static void tool_serial_send(const char *args, char *result, int result_len) {
 }
 
 /*============================================================================
+ * Network Tool Handlers (ping, curl, wget)
+ *============================================================================*/
+
+/* Parse a URL into scheme/host/port/path. Returns true on success. */
+static bool netParseUrl(const char *url, char *scheme, int scheme_len,
+                        char *host, int host_len, int *port, char *path, int path_len) {
+    const char *p = url;
+    const char *colon = strchr(url, ':');
+    if (colon && colon[1] == '/' && colon[2] == '/') {
+        int sl = colon - url;
+        if (sl >= scheme_len) sl = scheme_len - 1;
+        memcpy(scheme, url, sl); scheme[sl] = '\0';
+        p = colon + 3;
+    } else {
+        strcpy(scheme, "http");
+    }
+    int hl = 0;
+    while (*p && *p != ':' && *p != '/' && hl < host_len - 1) host[hl++] = *p++;
+    host[hl] = '\0';
+    if (*p == ':') {
+        p++;
+        *port = atoi(p);
+        while (*p && *p != '/') p++;
+    } else {
+        *port = (strcmp(scheme, "https") == 0) ? 443 : 80;
+    }
+    if (*p == '/') {
+        int pl = 0;
+        while (*p && pl < path_len - 1) path[pl++] = *p++;
+        path[pl] = '\0';
+    } else {
+        strcpy(path, "/");
+    }
+    return host[0] != '\0';
+}
+
+/* Connect to host:port. Uses TLS (insecure) for https. Returns client pointer
+ * (either &sec or &pln, both caller-provided) or NULL on failure. */
+static WiFiClient *netConnect(const char *host, int port, bool https,
+                              WiFiClientSecure &sec, WiFiClient &pln) {
+    if (https) {
+        sec.setInsecure();          /* ignore TLS certificate */
+        sec.setTimeout(10);
+        if (!sec.connect(host, port)) return nullptr;
+        return &sec;
+    }
+    pln.setTimeout(10);
+    if (!pln.connect(host, port)) return nullptr;
+    return &pln;
+}
+
+/* Send GET/HEAD and read full response (status line + headers + body) into buf.
+ * Returns HTTP status code (>0) or -1 on error. */
+static int netHttp(const char *url, bool head, char *buf, int buf_len) {
+    static WiFiClientSecure sec;
+    static WiFiClient pln;
+    char scheme[8], host[128], path[256];
+    int port = 0;
+    if (!netParseUrl(url, scheme, sizeof(scheme), host, sizeof(host), &port, path, sizeof(path))) {
+        snprintf(buf, buf_len, "Error: bad URL '%s'", url);
+        return -1;
+    }
+    bool https = (strcmp(scheme, "https") == 0);
+    WiFiClient *c = netConnect(host, port, https, sec, pln);
+    if (!c) {
+        snprintf(buf, buf_len, "Error: cannot connect to %s:%d", host, port);
+        return -1;
+    }
+    char req[400];
+    int rl = snprintf(req, sizeof(req),
+        "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: WireClaw\r\n"
+        "Accept: */*\r\nConnection: close\r\n\r\n",
+        head ? "HEAD" : "GET", path, host);
+    c->write((const uint8_t *)req, rl);
+
+    unsigned long t0 = millis();
+    while (!c->available()) {
+        if (!c->connected()) { snprintf(buf, buf_len, "Error: disconnected"); c->stop(); return -1; }
+        if (millis() - t0 > 10000) { snprintf(buf, buf_len, "Error: response timeout"); c->stop(); return -1; }
+        delay(20);
+    }
+    String status = c->readStringUntil('\n');
+    int code = status.substring(9, 12).toInt();
+
+    int total = 0;
+    int sl = status.length() < buf_len - 2 ? status.length() : buf_len - 2;
+    memcpy(buf, status.c_str(), sl); total = sl;
+    if (total < buf_len - 2) buf[total++] = '\n';
+
+    bool headers_done = false;
+    unsigned long last = millis();
+    while (total < buf_len - 1) {
+        if (c->available()) {
+            String line = c->readStringUntil('\n');
+            int ll = line.length();
+            if (!headers_done && ll <= 1) headers_done = true;
+            int room = buf_len - 1 - total;
+            int cp = ll < room ? ll : room;
+            memcpy(buf + total, line.c_str(), cp); total += cp;
+            if (total < buf_len - 1) buf[total++] = '\n';
+            last = millis();
+        } else if (!c->connected()) {
+            break;
+        } else if (millis() - last > 5000) {
+            break;
+        } else {
+            delay(10);
+        }
+    }
+    buf[total] = '\0';
+    c->stop();
+    return code;
+}
+
+static void tool_ping(const char *args, char *result, int result_len) {
+    char host[128];
+    if (!jsonArgString(args, "host", host, sizeof(host))) {
+        if (!jsonArgString(args, "url", host, sizeof(host))) {
+            snprintf(result, result_len, "Error: missing 'host' or 'url'");
+            return;
+        }
+    }
+    int port = jsonArgInt(args, "port", 0);
+    if (port == 0) {
+        char scheme[8];
+        const char *c = strchr(host, ':');
+        if (c && c[1] == '/' && c[2] == '/') {
+            int sl = c - host; if (sl >= (int)sizeof(scheme)) sl = sizeof(scheme) - 1;
+            memcpy(scheme, host, sl); scheme[sl] = '\0';
+            port = (strcmp(scheme, "https") == 0) ? 443 : 80;
+        } else {
+            port = 80;
+        }
+    }
+    WiFiClient conn;
+    conn.setTimeout(5000);
+    unsigned long t0 = millis();
+    bool ok = conn.connect(host, port);
+    unsigned long dt = millis() - t0;
+    if (ok) {
+        snprintf(result, result_len, "OK %s:%d reachable, %lums", host, port, dt);
+        conn.stop();
+    } else {
+        snprintf(result, result_len, "FAIL %s:%d unreachable", host, port);
+    }
+}
+
+static void tool_curl(const char *args, char *result, int result_len) {
+    char url[256];
+    if (!jsonArgString(args, "url", url, sizeof(url))) {
+        snprintf(result, result_len, "Error: missing 'url'");
+        return;
+    }
+    bool head = false;
+    if (jsonArgExists(args, "method")) {
+        char m[8];
+        if (jsonArgString(args, "method", m, sizeof(m)) && (m[0] == 'H' || m[0] == 'h')) head = true;
+    }
+    bool show_headers = jsonArgBool(args, "show_headers", true);
+    (void)jsonArgBool(args, "insecure", true); /* cert always ignored on ESP32 */
+
+    static char resp[TOOL_RESULT_MAX_LEN + 64];
+    int code = netHttp(url, head, resp, sizeof(resp));
+    if (code < 0) {
+        snprintf(result, result_len, "%s", resp);
+        return;
+    }
+    if (show_headers) {
+        snprintf(result, result_len, "[HTTP %d]\n%s", code, resp);
+    } else {
+        const char *body = strstr(resp, "\n\n");
+        body = body ? body + 2 : resp;
+        snprintf(result, result_len, "[HTTP %d]\n%s", code, body);
+    }
+}
+
+static void tool_wget(const char *args, char *result, int result_len) {
+    static WiFiClientSecure sec;
+    static WiFiClient pln;
+    char url[256];
+    char path[64];
+    if (!jsonArgString(args, "url", url, sizeof(url))) {
+        snprintf(result, result_len, "Error: missing 'url'"); return;
+    }
+    if (!jsonArgString(args, "path", path, sizeof(path))) {
+        snprintf(result, result_len, "Error: missing 'path'"); return;
+    }
+    if (strcmp(path, "/config.json") == 0) {
+        snprintf(result, result_len, "Error: cannot overwrite config.json"); return;
+    }
+    (void)jsonArgBool(args, "insecure", true); /* cert always ignored on ESP32 */
+
+    char scheme[8], host[128], ppath[256];
+    int port = 0;
+    if (!netParseUrl(url, scheme, sizeof(scheme), host, sizeof(host), &port, ppath, sizeof(ppath))) {
+        snprintf(result, result_len, "Error: bad URL"); return;
+    }
+    bool https = (strcmp(scheme, "https") == 0);
+    WiFiClient *c = netConnect(host, port, https, sec, pln);
+    if (!c) { snprintf(result, result_len, "Error: cannot connect to %s:%d", host, port); return; }
+
+    char req[400];
+    int rl = snprintf(req, sizeof(req),
+        "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: WireClaw\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+        ppath, host);
+    c->write((const uint8_t *)req, rl);
+
+    unsigned long t0 = millis();
+    while (!c->available()) {
+        if (!c->connected()) { snprintf(result, result_len, "Error: disconnected"); c->stop(); return; }
+        if (millis() - t0 > 10000) { snprintf(result, result_len, "Error: timeout"); c->stop(); return; }
+        delay(20);
+    }
+    String status = c->readStringUntil('\n');
+    int code = status.substring(9, 12).toInt();
+    while (c->connected()) {
+        String line = c->readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) break;
+    }
+    File f = LittleFS.open(path, "w");
+    if (!f) { snprintf(result, result_len, "Error: cannot open %s", path); c->stop(); return; }
+    int total = 0;
+    unsigned long last = millis();
+    uint8_t chunk[256];
+    while (c->connected() || c->available()) {
+        int avail = c->available();
+        if (avail > 0) {
+            int rd = c->readBytes(chunk, avail < (int)sizeof(chunk) ? avail : (int)sizeof(chunk));
+            f.write(chunk, rd); total += rd; last = millis();
+        } else if (millis() - last > 5000) {
+            break;
+        } else {
+            delay(10);
+        }
+    }
+    f.close();
+    c->stop();
+    snprintf(result, result_len, "Saved %d bytes (HTTP %d) to %s", total, code, path);
+}
+
+/*============================================================================
  * Multi-Device Tool Handler
  *============================================================================*/
 
@@ -1168,6 +1414,12 @@ bool toolExecute(const char *name, const char *args_json,
         tool_remote_chat(args_json, result, result_len);
     } else if (strcmp(name, "chain_create") == 0) {
         tool_chain_create(args_json, result, result_len);
+    } else if (strcmp(name, "ping") == 0) {
+        tool_ping(args_json, result, result_len);
+    } else if (strcmp(name, "curl") == 0) {
+        tool_curl(args_json, result, result_len);
+    } else if (strcmp(name, "wget") == 0) {
+        tool_wget(args_json, result, result_len);
     } else {
         snprintf(result, result_len, "Error: unknown tool '%s'", name);
         return false;
